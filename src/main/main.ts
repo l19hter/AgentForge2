@@ -7,6 +7,7 @@ import {
   clipboard,
   IpcMainInvokeEvent,
 } from 'electron'
+import * as fs from 'fs'
 import * as path from 'path'
 import { getWorkspaceDir, setWorkspaceDir, getDataDir } from './paths'
 import { seedWorkspace } from './file-manager'
@@ -27,8 +28,21 @@ let mainWindow: BrowserWindow | null = null
 
 const getWindow = (): BrowserWindow | null => mainWindow
 
+/**
+ * Иконка окна и панели задач.
+ *
+ * Лежит рядом с исходниками, а не в dist: путь одинаково рабочий и при запуске
+ * из папки проекта, и внутри asar собранного приложения. Если файла нет,
+ * возвращаем undefined — Electron подставит свою, и окно всё равно откроется.
+ */
+function appIcon(): string | undefined {
+  const file = path.join(app.getAppPath(), 'assets', 'icon.ico')
+  return fs.existsSync(file) ? file : undefined
+}
+
 function createWindow(): void {
   mainWindow = new BrowserWindow({
+    icon: appIcon(),
     width: 1600,
     height: 1000,
     minWidth: 1100,

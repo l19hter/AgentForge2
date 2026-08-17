@@ -43,7 +43,17 @@ $shortcut = $shell.CreateShortcut($linkPath)
 $shortcut.TargetPath = $target
 $shortcut.Arguments = $arguments
 $shortcut.WorkingDirectory = $workDir
-$shortcut.IconLocation = "$target,0"
+# Иконка приложения. У собранного EXE она уже внутри, а при запуске через
+# electron.exe ярлык взял бы иконку самого Electron — поэтому указываем свою.
+$iconFile = Join-Path $projectRoot 'assets\icon.ico'
+if (Test-Path $iconFile) {
+    $shortcut.IconLocation = "$iconFile,0"
+    Write-Output "Иконка: $iconFile"
+}
+else {
+    $shortcut.IconLocation = "$target,0"
+    Write-Output 'Иконка: своя не найдена, взята из целевого файла (npm run icon соберёт её)'
+}
 $shortcut.Description = 'AgentForge Studio — команда AI-агентов'
 $shortcut.Save()
 
