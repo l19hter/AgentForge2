@@ -268,6 +268,9 @@ export interface PipelineRun {
   subtasks: PipelineSubtask[]
   log: PipelineLogEntry[]
   checks: { ran: boolean; passed: boolean; summary: string } | null
+  runtime: { ran: boolean; ok: boolean; summary: string } | null
+  design: { before: number; after: number | null } | null
+  screenshot: string | null
   review: { critical: string[]; text: string } | null
   fixAttempts: number
   taskId: string | null

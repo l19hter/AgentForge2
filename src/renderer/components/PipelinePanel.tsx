@@ -88,6 +88,31 @@ export default function PipelinePanel({ run, projectName, onStart, onStop }: Pip
                   : `Сборка: ${run.checks.passed ? 'проходит' : 'падает'}`}
               </div>
             )}
+            {run.runtime && run.runtime.ran && (
+              <div style={{ fontSize: '10px', color: run.runtime.ok ? ps.ok : ps.err }}>
+                Запуск приложения: {run.runtime.ok ? 'отвечает, замечаний нет' : 'есть замечания'}
+              </div>
+            )}
+            {run.design && (
+              <div
+                style={{
+                  fontSize: '10px',
+                  color:
+                    run.design.after === null
+                      ? ps.textDim
+                      : run.design.after < run.design.before
+                        ? ps.ok
+                        : ps.warn,
+                }}
+              >
+                {run.design.after === null
+                  ? run.design.before === 0
+                    ? 'Оформление: замечаний нет'
+                    : `Оформление: замечаний ${run.design.before}, дизайнер не правил`
+                  : `Оформление: было ${run.design.before}, стало ${run.design.after}`}
+              </div>
+            )}
+            {run.screenshot && <Preview path={run.screenshot} />}
             {run.review && run.review.critical.length > 0 && (
               <div style={{ fontSize: '10px', color: ps.err, lineHeight: 1.5 }}>
                 Тестер: критических замечаний {run.review.critical.length}
@@ -200,6 +225,40 @@ export default function PipelinePanel({ run, projectName, onStart, onStop }: Pip
           Остановить
         </button>
       </div>
+    </div>
+  )
+}
+
+/**
+ * Снимок готовой страницы.
+ *
+ * Файл лежит в данных приложения, а renderer работает по file://, поэтому
+ * картинка подключается напрямую по файловому адресу — без IPC и без копии в
+ * памяти. Путь к снимку меняется вместе с прогоном, поэтому к адресу добавлена
+ * метка времени: иначе браузер показал бы снимок предыдущего прогона из кэша.
+ */
+function Preview({ path }: { path: string }) {
+  const [failed, setFailed] = useState(false)
+  if (failed) return null
+
+  const url = `file:///${path.replace(/\\/g, '/')}?t=${Date.now()}`
+  return (
+    <div style={{ marginTop: '4px' }}>
+      <div style={{ fontSize: '10px', color: ps.textFaint, marginBottom: '3px' }}>
+        Как выглядит готовая страница
+      </div>
+      <img
+        src={url}
+        alt="Снимок готовой страницы"
+        onError={() => setFailed(true)}
+        style={{
+          width: '100%',
+          display: 'block',
+          border: `1px solid ${ps.border}`,
+          borderRadius: '2px',
+          background: ps.sunken,
+        }}
+      />
     </div>
   )
 }

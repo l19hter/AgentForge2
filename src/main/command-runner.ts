@@ -32,9 +32,63 @@ export interface CheckStep {
   label: string
   command: string
   args: string[]
+  /** Папка запуска. Пусто — корень проекта. */
+  dir?: string
   /** true — падение шага не считается провалом проверки (например, тестов просто нет). */
   optional?: boolean
   timeoutMs?: number
+}
+
+/** Папки, внутрь которых искать проекты бессмысленно. */
+const SKIP_SCAN = new Set([
+  'node_modules', '.git', 'dist', 'build', 'release', '.next',
+  'coverage', '__pycache__', 'venv', '.venv', '.turbo', 'deploy',
+])
+
+const MANIFEST_FILES = ['package.json', 'requirements.txt', 'pyproject.toml']
+
+/**
+ * Где в проекте лежат манифесты.
+ *
+ * Раньше смотрели только в корень — и раскладка «backend/ + frontend/», которую
+ * конвейер сам же и создаёт для крупных задач, проходила вообще без проверок:
+ * «проверять нечем», статус unverified, гейт мимо. Теперь заглядываем и внутрь,
+ * но неглубоко: манифест на третьем уровне вложенности — это уже пакет внутри
+ * пакета, а не отдельная часть проекта.
+ */
+export function findManifestRoots(cwd?: string): string[] {
+  const root = cwd ?? getProjectDir()
+  const roots: string[] = []
+
+  const hasManifest = (dir: string): boolean =>
+    MANIFEST_FILES.some((f) => fs.existsSync(path.join(dir, f)))
+
+  if (hasManifest(root)) roots.push(root)
+
+  const scan = (dir: string, depth: number): void => {
+    if (depth > 2 || roots.length >= 4) return
+    let entries: fs.Dirent[]
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true })
+    } catch {
+      return
+    }
+    for (const e of entries) {
+      if (!e.isDirectory() || SKIP_SCAN.has(e.name) || e.name.startsWith('.')) continue
+      const full = path.join(dir, e.name)
+      if (hasManifest(full)) {
+        if (!roots.includes(full)) roots.push(full)
+        // Внутрь найденного проекта не идём: его собственные подпакеты
+        // соберутся его же сборкой.
+        continue
+      }
+      scan(full, depth + 1)
+    }
+  }
+
+  // В корне манифест есть — вложенные пакеты обычно часть той же сборки.
+  if (roots.length === 0) scan(root, 1)
+  return roots
 }
 
 function clamp(text: string): string {
@@ -45,7 +99,8 @@ function clamp(text: string): string {
   return `${head}\n\n… пропущено ${cut} символов …\n\n${tail}`
 }
 
-function killTree(proc: ChildProcess): void {
+/** Убивает процесс вместе с потомками: npm запускает настоящую команду отдельным процессом. */
+export function killTree(proc: ChildProcess): void {
   if (proc.pid === undefined) return
   if (process.platform === 'win32') {
     spawn('taskkill', ['/pid', String(proc.pid), '/T', '/F'], { stdio: 'ignore' })
@@ -60,7 +115,7 @@ function killTree(proc: ChildProcess): void {
 
 export function runCommand(step: CheckStep, cwd?: string): Promise<CommandResult> {
   const started = Date.now()
-  const dir = cwd ?? getProjectDir()
+  const dir = step.dir ?? cwd ?? getProjectDir()
   const printable = `${step.command} ${step.args.join(' ')}`.trim()
 
   return new Promise((resolve) => {
@@ -134,9 +189,28 @@ function readPackageJson(dir: string): PackageJson | null {
 /**
  * Определяет, чем проверять проект. Пустой список означает, что проверять
  * нечем — тогда вердикт выносится только по ревью кода.
+ *
+ * Обходит все найденные манифесты: у раскладки «backend + frontend» своя
+ * сборка и свои тесты в каждой половине.
  */
 export function planChecks(cwd?: string): CheckStep[] {
-  const dir = cwd ?? getProjectDir()
+  const roots = findManifestRoots(cwd)
+  const root = cwd ?? getProjectDir()
+  const steps: CheckStep[] = []
+
+  for (const dir of roots) {
+    const rel = path.relative(root, dir).split(path.sep).join('/')
+    // Имя папки в подписи нужно, чтобы в сводке было видно, где что упало.
+    const prefix = rel ? `${rel}: ` : ''
+    for (const step of planChecksIn(dir)) {
+      steps.push({ ...step, label: prefix + step.label, dir })
+    }
+  }
+  return steps
+}
+
+/** Шаги проверки для одной папки с манифестом. */
+function planChecksIn(dir: string): CheckStep[] {
   const steps: CheckStep[] = []
   const pkg = readPackageJson(dir)
 

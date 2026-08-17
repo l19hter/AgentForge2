@@ -1,4 +1,5 @@
 import { ipcMain, IpcMainInvokeEvent, BrowserWindow } from 'electron'
+import * as path from 'path'
 import {
   streamChat,
   getDailyUsage,
@@ -7,8 +8,22 @@ import {
 } from './api-client'
 import { appendMessage, type ChatMessage as StoredMessage } from './chat-store'
 import { getActiveProjectId, getProjectDir } from './projects'
-import { buildProjectContext, listProjectFiles } from './code-context'
+import {
+  buildProjectContext,
+  listProjectFiles,
+  readFileForContext,
+  type DeliveryKind,
+} from './code-context'
 import { runChecks, type CheckReport } from './command-runner'
+import {
+  runRuntimeCheck,
+  stopRuntimeCheck,
+  type PageSnapshot,
+  type RuntimeReport,
+  type ScenarioStep,
+} from './runtime-check'
+import { describeLayout, type LayoutReport } from './layout-audit'
+import { getDataDir } from './paths'
 import { writeProjectFile } from './file-ops'
 import { parseFileBlocks } from '../shared/code-blocks'
 import { addTask, updateSubtask, type TaskTree } from './decomposition'
@@ -71,6 +86,12 @@ export interface PipelineRun {
   log: LogEntry[]
   /** Итог последнего прогона проверок — то, на основании чего выносится вердикт. */
   checks: { ran: boolean; passed: boolean; summary: string } | null
+  /** Итог «подними и постучись»: работает ли приложение, а не только компилируется. */
+  runtime: { ran: boolean; ok: boolean; summary: string } | null
+  /** Оформление: сколько замечаний было и сколько осталось после дизайнера. */
+  design: { before: number; after: number | null } | null
+  /** Снимок готовой страницы — путь в данных приложения, не в папке проекта. */
+  screenshot: string | null
   /** Замечания Тестера: critical блокирует приёмку наравне с падением сборки. */
   review: { critical: string[]; text: string } | null
   fixAttempts: number
@@ -270,11 +291,12 @@ interface RawPlan {
   subtasks?: unknown
 }
 
-function extractJson(text: string): string | null {
+/** Вырезает JSON из ответа модели: объект по умолчанию, массив — для сценария. */
+function extractJson(text: string, open = '{', close = '}'): string | null {
   const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/)
   const body = fenced ? fenced[1] : text
-  const start = body.indexOf('{')
-  const end = body.lastIndexOf('}')
+  const start = body.indexOf(open)
+  const end = body.lastIndexOf(close)
   if (start === -1 || end <= start) return null
   return body.slice(start, end + 1)
 }
@@ -494,7 +516,20 @@ async function doSubtask(sub: PipelineSubtask): Promise<boolean> {
       return false
     }
 
-    log('info', `Просит файлы: ${requested.join(', ')} — досылаю`, sub.assignee)
+    // Говорим ровно то, что произошло: раньше здесь было «досылаю» даже для
+    // файлов, содержимое которых прочесть нечем, и пропажу было не видно.
+    const projectId = run.projectId
+    const delivery = requested.map((f) => ({
+      path: f,
+      kind: readFileForContext(f, projectId)?.kind ?? 'binary',
+    }))
+    const label = (k: DeliveryKind): string =>
+      k === 'converted' ? ' (таблица — превью)' : k === 'binary' ? ' (двоичный — только описание)' : ''
+    log(
+      'info',
+      `Просит файлы: ${delivery.map((d) => d.path + label(d.kind)).join(', ')} — досылаю`,
+      sub.assignee
+    )
     const extra2 = [
       buildProjectContext({ keywords, projectId: run.projectId, include: requested }),
       WORKER_FORMAT,
@@ -555,11 +590,197 @@ const TESTER_FORMAT = `## Формат этого ответа
 пожелания на будущее — это [WARNING].
 Если критических дефектов нет, ни одной строки с [CRITICAL] быть не должно.`
 
-/** Результат приёмки: объективные проверки плюс ревью Тестера. */
+const SCENARIO_INSTRUCTION = `## Формат этого ответа
+
+Приложение уже запущено, страница открыта в браузере. Опиши ОДИН главный
+пользовательский сценарий — тот, ради которого приложение написано, — списком
+шагов, которые за тебя проиграют.
+
+Ответь ТОЛЬКО JSON-массивом, без пояснений и без markdown-ограды:
+
+[
+  { "action": "fill", "selector": "#input-id", "value": "текст" },
+  { "action": "click", "selector": "#button-id" },
+  { "action": "waitFor", "selector": ".item" },
+  { "action": "expectText", "value": "текст" }
+]
+
+Правила:
+- селекторы бери ТОЛЬКО из списка элементов выше, не придумывай свои;
+- допустимые действия: fill, click, waitFor, expectText, expectChecked, expectEnabled;
+- у fill и expectText обязательно поле value, у остальных — selector;
+- не больше 8 шагов, и хотя бы один из них — проверка результата
+  (expectText, expectChecked или expectEnabled);
+- проверяй то, что обещано в цели проекта, а не то, чего никто не просил.`
+
+/** Максимум шагов: длинный сценарий чаще ломается сам, чем ловит дефект. */
+const MAX_SCENARIO_STEPS = 8
+
+const SCENARIO_ACTIONS = ['fill', 'click', 'waitFor', 'expectText', 'expectChecked', 'expectEnabled']
+
+/**
+ * Разбирает сценарий, присланный Тестером.
+ *
+ * Проверка строгая намеренно: шаги уходят в исполнение на странице, поэтому
+ * всё, что не опознано дословно, отбрасывается. Модель присылает данные, а не
+ * код, и никакой текст от неё в браузере не выполняется.
+ */
+function parseScenario(text: string): ScenarioStep[] {
+  const json = extractJson(text, '[', ']')
+  if (!json) return []
+
+  let raw: unknown
+  try {
+    raw = JSON.parse(json)
+  } catch {
+    return []
+  }
+  if (!Array.isArray(raw)) return []
+
+  const steps: ScenarioStep[] = []
+  for (const item of raw.slice(0, MAX_SCENARIO_STEPS)) {
+    if (!item || typeof item !== 'object') continue
+    const s = item as Record<string, unknown>
+    const action = typeof s.action === 'string' ? s.action : ''
+    if (!SCENARIO_ACTIONS.includes(action)) continue
+
+    const selector = typeof s.selector === 'string' ? s.selector.trim() : ''
+    const value = typeof s.value === 'string' ? s.value : ''
+
+    if (action === 'expectText') {
+      if (value) steps.push({ action: 'expectText', value })
+      continue
+    }
+    if (!selector) continue
+    if (action === 'fill') {
+      if (value) steps.push({ action: 'fill', selector, value })
+      continue
+    }
+    if (action === 'click') steps.push({ action: 'click', selector })
+    else if (action === 'waitFor') steps.push({ action: 'waitFor', selector })
+    else if (action === 'expectChecked') steps.push({ action: 'expectChecked', selector })
+    else if (action === 'expectEnabled') steps.push({ action: 'expectEnabled', selector })
+  }
+
+  // Сценарий без единой проверки ничего не доказывает: заполнить поле и нажать
+  // кнопку можно и в сломанном приложении.
+  const hasCheck = steps.some((s) => s.action.startsWith('expect'))
+  return hasCheck ? steps : []
+}
+
+/** Просит Тестера описать главный пользовательский путь по тому, что видно на странице. */
+async function askTesterForScenario(page: PageSnapshot): Promise<ScenarioStep[]> {
+  if (!run) return []
+
+  const elements = page.elements
+    .map((e) => {
+      const parts = [`${e.selector} — ${e.tag}`]
+      if (e.type) parts.push(`тип ${e.type}`)
+      if (e.placeholder) parts.push(`подсказка «${e.placeholder}»`)
+      if (e.text) parts.push(`текст «${e.text}»`)
+      if (e.disabled) parts.push('отключён')
+      return `- ${parts.join(', ')}`
+    })
+    .join('\n')
+
+  const reply = await callAgent(
+    'tester',
+    [
+      `# Цель проекта\n${run.goal}`,
+      `\n# Страница ${page.url}\nЗаголовок: ${page.title || '(нет)'}`,
+      `\n# Элементы страницы\n${elements || '(интерактивных элементов не найдено)'}`,
+      `\n# Разметка (начало)\n\`\`\`html\n${page.html.slice(0, 2500)}\n\`\`\``,
+    ].join('\n'),
+    SCENARIO_INSTRUCTION
+  )
+  if (reply.error) {
+    log('info', `Сценарий не составлен: ${reply.error}`, 'tester')
+    return []
+  }
+
+  const steps = parseScenario(reply.text)
+  if (steps.length === 0) log('info', 'Тестер не прислал разборчивого сценария', 'tester')
+  else log('info', `Сценарий из ${steps.length} шагов — проигрываю`, 'tester')
+  return steps
+}
+
+const DESIGN_INSTRUCTION = `## Формат этого ответа
+
+Приложение запущено, страница открыта, мерки сняты. Исправь оформление по
+замечаниям ниже — и только оформление.
+
+- присылай ПОЛНОЕ содержимое каждого изменённого файла блоком с путём:
+  \`\`\`css path=public/style.css
+  ...полное содержимое...
+  \`\`\`
+- никаких пояснений вне блоков кода;
+- логику не трогай: обработчики, запросы, имена id и классов, по которым
+  цепляется скрипт, должны остаться прежними — иначе приложение сломается;
+- меняй минимум файлов, обычно достаточно одного файла стилей;
+- ничего не подключай из интернета: ни шрифтов, ни библиотек, ни картинок.
+
+Каждое замечание ниже снято измерением, а не на глаз. После твоей правки
+страницу перечитают и обмеряют заново, поэтому отвечать общими словами
+бессмысленно — считаться будет результат.`
+
+/**
+ * Отдаёт замечания дизайнеру и записывает присланные файлы.
+ *
+ * Возвращает true, только если что-то действительно записано: механика по
+ * этому признаку решает, перечитывать ли страницу и снимать ли мерки заново.
+ */
+async function askDesigner(page: PageSnapshot, report: LayoutReport): Promise<boolean> {
+  if (!run) return false
+
+  log('info', `Замечаний по вёрстке: ${report.findings.length} — отдаю дизайнеру`, 'designer')
+
+  const context = buildProjectContext({
+    keywords: ['css', 'style', 'index.html', 'app.js'],
+    projectId: run.projectId,
+  })
+  const task = [
+    `# Цель проекта\n${run.goal}`,
+    `\n# Что измерено на странице ${page.url}\n${describeLayout(report)}`,
+    `\n# Состав страницы\n${page.html.slice(0, 3000)}`,
+  ].join('\n')
+
+  const reply = await callAgent('designer', task, [context, DESIGN_INSTRUCTION].filter(Boolean).join('\n\n'))
+  if (reply.error) {
+    log('err', `Ошибка запроса к дизайнеру: ${reply.error}`, 'designer')
+    return false
+  }
+
+  const blocks = parseFileBlocks(reply.text)
+  if (blocks.length === 0) {
+    log('info', 'Дизайнер не прислал файлов', 'designer')
+    return false
+  }
+
+  let wrote = false
+  for (const b of blocks) {
+    const res = writeProjectFile(b.path, b.code, run.projectId)
+    if (res.ok) {
+      wrote = true
+      log('ok', `Оформление: обновлён ${b.path}`, 'designer')
+    } else {
+      log('err', `Не записан ${b.path}: ${res.message ?? 'ошибка'}`, 'designer')
+    }
+  }
+  return wrote
+}
+
+/** Куда класть снимок готовой страницы: рядом с данными приложения, не в проект. */
+function screenshotPathFor(projectId: string): string {
+  return path.join(getDataDir(), 'previews', `${projectId}.png`)
+}
+
+/** Результат приёмки: сборка, работающее приложение и ревью Тестера. */
 interface Verdict {
   report: CheckReport
   /** Строки отчёта с меткой [CRITICAL] — блокируют приёмку. */
   critical: string[]
+  /** Итог «подними и постучись»: null, если до него не дошло. */
+  runtime: RuntimeReport | null
 }
 
 /**
@@ -586,8 +807,9 @@ async function doVerify(): Promise<Verdict> {
   setStatus('verifying')
   log('info', 'Прогон сборки и тестов', 'tester')
 
-  const report = await runChecks(run ? getProjectDir(run.projectId) : undefined)
-  if (!run) return { report, critical: [] }
+  const projectDir = run ? getProjectDir(run.projectId) : undefined
+  const report = await runChecks(projectDir)
+  if (!run) return { report, critical: [], runtime: null }
 
   run.checks = { ran: report.ran, passed: report.passed, summary: report.summary }
   log(
@@ -600,18 +822,82 @@ async function doVerify(): Promise<Verdict> {
     'tester'
   )
 
+  // Поднимать неработающую сборку бессмысленно: сначала должно компилироваться.
+  let runtime: RuntimeReport | null = null
+  if (!report.ran || report.passed) {
+    log('info', 'Запуск приложения и проверка запросами', 'tester')
+    runtime = await runRuntimeCheck(projectDir, {
+      scenario: askTesterForScenario,
+      design: askDesigner,
+      screenshotPath: screenshotPathFor(run.projectId),
+    })
+    if (!run) return { report, critical: [], runtime }
+
+    run.runtime = { ran: runtime.ran, ok: runtime.ok, summary: runtime.summary }
+    run.design = runtime.layout
+      ? {
+          before: runtime.layout.before.findings.length,
+          after: runtime.layout.after ? runtime.layout.after.findings.length : null,
+        }
+      : null
+    if (runtime.screenshot) run.screenshot = runtime.screenshot
+    if (runtime.layout) {
+      const before = runtime.layout.before.findings.length
+      const after = runtime.layout.after?.findings.length
+      if (after === undefined) {
+        log(
+          before === 0 ? 'ok' : 'info',
+          before === 0 ? 'Вёрстка по меркам без замечаний' : `Вёрстка: замечаний ${before}, дизайнер не правил`,
+          'designer'
+        )
+      } else {
+        log(
+          after < before ? 'ok' : 'err',
+          `Вёрстка: было замечаний ${before}, после правки ${after}`,
+          'designer'
+        )
+      }
+    }
+
+    if (runtime.scenario.length > 0) {
+      const passed = runtime.scenario.filter((s) => s.ok).length
+      log(
+        passed === runtime.scenario.length ? 'ok' : 'err',
+        `Сценарий пользователя: пройдено шагов ${passed} из ${runtime.scenario.length}`,
+        'tester'
+      )
+    }
+
+    if (!runtime.ran) {
+      log('info', 'Приложение не веб — проверять в браузере нечего', 'tester')
+    } else if (runtime.ok) {
+      log('ok', 'Приложение поднялось и отвечает', 'tester')
+    } else {
+      log('err', `Работающее приложение: замечаний ${runtime.findings.length}`, 'tester')
+      for (const f of runtime.findings) {
+        log(f.severity === 'hard' ? 'err' : 'info', f.text.split('\n')[0].slice(0, 200), 'tester')
+      }
+    }
+  }
+
   const context = buildProjectContext({ budget: 30_000, projectId: run.projectId })
   const extra = [context, TESTER_FORMAT].filter(Boolean).join('\n\n')
   const reply = await callAgent(
     'tester',
-    `# Цель проекта\n${run.goal}\n\n# Результат автоматических проверок\n${report.summary}`,
+    [
+      `# Цель проекта\n${run.goal}`,
+      `\n# Результат автоматических проверок\n${report.summary}`,
+      runtime?.ran ? `\n# Результат запуска приложения\n${runtime.summary}` : '',
+    ]
+      .filter(Boolean)
+      .join('\n'),
     extra
   )
   if (reply.error) {
     log('err', `Ошибка запроса к Tester: ${reply.error}`, 'tester')
     run.review = null
     emit()
-    return { report, critical: [] }
+    return { report, critical: [], runtime }
   }
 
   const critical = extractCritical(reply.text)
@@ -624,12 +910,18 @@ async function doVerify(): Promise<Verdict> {
   }
 
   emit()
-  return { report, critical }
+  return { report, critical, runtime }
 }
 
-/** Работа принимается, только когда прошли и объективные проверки, и ревью. */
+/** Замечания «подними и постучись», из-за которых работу принимать нельзя. */
+function runtimeBlockers(v: Verdict): string[] {
+  if (!v.runtime || !v.runtime.ran || v.runtime.ok) return []
+  return v.runtime.findings.filter((f) => f.severity === 'hard').map((f) => f.text)
+}
+
+/** Работа принимается, только когда прошли сборка, запуск и ревью. */
 function needsFix(v: Verdict): boolean {
-  return (v.report.ran && !v.report.passed) || v.critical.length > 0
+  return (v.report.ran && !v.report.passed) || v.critical.length > 0 || runtimeBlockers(v).length > 0
 }
 
 /** Исполнители, которые действительно что-то записали, — только им есть что чинить. */
@@ -721,9 +1013,14 @@ async function doFix(v: Verdict): Promise<boolean> {
   run.fixAttempts++
 
   const buildBroken = v.report.ran && !v.report.passed
-  // Сборка объективнее ревью, поэтому исполнителя выбираем по ней, когда она
-  // упала; критические замечания идут в задание вместе с ней в любом случае.
-  const blame = buildBroken ? v.report.summary : v.critical.join('\n')
+  const blockers = runtimeBlockers(v)
+  // Порядок объективности: не собралось → не работает → не понравилось ревью.
+  // По этому же тексту выбираем исполнителя: в нём вернее всего назван виновный файл.
+  const blame = buildBroken
+    ? v.report.summary
+    : blockers.length > 0
+      ? blockers.join('\n')
+      : v.critical.join('\n')
   const assignee = await pickFixer(blame)
   log('info', `Исправление, попытка ${run.fixAttempts} из ${MAX_FIX_ATTEMPTS}`, assignee)
 
@@ -744,9 +1041,17 @@ async function doFix(v: Verdict): Promise<boolean> {
       '```'
     )
   }
+  if (blockers.length > 0) {
+    task.push(
+      task.length ? '\n# Кроме того, приложение подняли и постучались в него' : '# Приложение подняли и постучались в него',
+      'Так это выглядит со стороны браузера и клиента. Исправь каждое замечание и пришли изменённые файлы целиком.',
+      '',
+      ...blockers.map((b) => `- ${b}`)
+    )
+  }
   if (v.critical.length > 0) {
     task.push(
-      buildBroken ? '\n# Кроме того, Тестер нашёл критические дефекты' : '# Тестер нашёл критические дефекты',
+      task.length ? '\n# Кроме того, Тестер нашёл критические дефекты' : '# Тестер нашёл критические дефекты',
       'Исправь каждый и пришли изменённые файлы целиком.',
       '',
       ...v.critical.map((c) => `- ${c}`)
@@ -810,6 +1115,9 @@ export function startPipeline(goal: string): PipelineRun | null {
     subtasks: [],
     log: [],
     checks: null,
+    runtime: null,
+    design: null,
+    screenshot: null,
     review: null,
     fixAttempts: 0,
     taskId: null,
@@ -931,6 +1239,10 @@ async function runRemainder(): Promise<void> {
     log('err', 'Сборка так и не проходит — нужна ручная правка')
     return setStatus('failed')
   }
+  if (runtimeBlockers(verdict).length > 0) {
+    log('err', 'Приложение собирается, но работает неправильно — нужна ручная правка')
+    return setStatus('failed')
+  }
   if (verdict.critical.length > 0) {
     log('err', 'Тестер настаивает на критических замечаниях — нужна ручная правка')
     return setStatus('failed')
@@ -955,6 +1267,9 @@ async function runRemainder(): Promise<void> {
 export function shutdownPipeline(): void {
   stopRequested = true
   abort?.abort()
+  // Проверка могла держать поднятый сервер проекта: он переживёт закрытие
+  // приложения и останется занимать порт, если его не убить явно.
+  stopRuntimeCheck()
 }
 
 /** Остановка по кнопке пользователя — в отличие от выхода, закрывает и гейт. */

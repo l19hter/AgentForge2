@@ -160,6 +160,16 @@ export const DEFAULT_AGENTS: AgentConfig[] = [
     systemPromptPath: '.claude/agents/tester-worker.md',
     mode: 'auto',
   },
+  {
+    id: 'designer',
+    name: 'Designer',
+    role: 'Интерфейс и типографика',
+    icon: 'layout',
+    model: 'moonshot-v1-32k',
+    heavyModel: 'claude-sonnet-5',
+    systemPromptPath: '.claude/agents/designer-agent.md',
+    mode: 'auto',
+  },
 ]
 
 /** Провайдер определяется по имени модели — так UI и бэкенд не могут разойтись. */

@@ -178,6 +178,12 @@ export interface PipelineRun {
   subtasks: PipelineSubtask[]
   log: PipelineLogEntry[]
   checks: { ran: boolean; passed: boolean; summary: string } | null
+  /** Итог «подними и постучись»: работает ли приложение, а не только компилируется. */
+  runtime: { ran: boolean; ok: boolean; summary: string } | null
+  /** Оформление: сколько замечаний было и сколько осталось после дизайнера. */
+  design: { before: number; after: number | null } | null
+  /** Снимок готовой страницы. */
+  screenshot: string | null
   /** Замечания Тестера: critical блокирует приёмку наравне с падением сборки. */
   review: { critical: string[]; text: string } | null
   fixAttempts: number

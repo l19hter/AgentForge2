@@ -1,6 +1,7 @@
 import * as fs from 'fs'
 import * as path from 'path'
 import { getProjectDir } from './projects'
+import { isSpreadsheet, readSpreadsheetAsText } from './spreadsheet'
 
 /**
  * Сбор контекста проекта для промпта воркера.
@@ -42,6 +43,9 @@ const TEXT_EXT = new Set([
   '.html', '.css', '.scss', '.sass', '.less',
   '.md', '.txt', '.sql', '.sh', '.bat', '.ps1',
   '.vue', '.svelte', '.prisma', '.graphql',
+  // Таблицы читаются превью через spreadsheet.ts: в папке проекта они почти
+  // всегда исходные данные заказчика, а не мусор.
+  '.xlsx', '.xlsm', '.csv',
 ])
 
 /** Манифесты идут в контекст всегда: из них видно стек, скрипты и зависимости. */
@@ -107,18 +111,87 @@ export function listProjectFiles(projectId?: string, maxDepth = 8): ProjectFile[
   return out
 }
 
-function readCapped(relPath: string, projectId?: string): string | null {
+export type DeliveryKind =
+  /** Обычный текстовый файл. */
+  | 'text'
+  /** Двоичный формат, который удалось превратить в текст (таблица Excel). */
+  | 'converted'
+  /** Прочесть нечем — в контекст уходит honest-описание вместо содержимого. */
+  | 'binary'
+
+export interface FileForContext {
+  kind: DeliveryKind
+  text: string
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} Б`
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} КБ`
+  return `${(bytes / 1024 / 1024).toFixed(1)} МБ`
+}
+
+/**
+ * Готовит содержимое файла для промпта.
+ *
+ * Двоичный файл раньше просто исчезал: агент просил у пользователя смету в
+ * .xlsx, конвейер отвечал «досылаю» и не досылал ничего, а агент писал парсер
+ * по догадке. Теперь таблицы читаются, а всё остальное честно описывается —
+ * пусть агент знает, что файл есть, но его содержимое ему не показали.
+ */
+export function readFileForContext(relPath: string, projectId?: string): FileForContext | null {
   const abs = path.join(getProjectDir(projectId), relPath)
+
+  let stat: fs.Stats
   try {
-    const raw = fs.readFileSync(abs, 'utf-8')
-    // Бинарник, случайно попавший по расширению: NUL-байт — надёжный признак.
-    if (raw.includes('\0')) return null
-    return raw.length > MAX_FILE_CHARS
-      ? raw.slice(0, MAX_FILE_CHARS) + '\n… (файл обрезан)'
-      : raw
+    stat = fs.statSync(abs)
   } catch {
     return null
   }
+
+  if (isSpreadsheet(relPath)) {
+    try {
+      const preview = readSpreadsheetAsText(fs.readFileSync(abs))
+      if (preview) {
+        return {
+          kind: 'converted',
+          text:
+            preview.length > MAX_FILE_CHARS
+              ? preview.slice(0, MAX_FILE_CHARS) + '\n… (превью обрезано)'
+              : preview,
+        }
+      }
+    } catch {
+      /* не разобралось — уйдёт как двоичный */
+    }
+  }
+
+  try {
+    const raw = fs.readFileSync(abs, 'utf-8')
+    // Бинарник, случайно попавший по расширению: NUL-байт — надёжный признак.
+    if (!raw.includes('\0')) {
+      return {
+        kind: 'text',
+        text:
+          raw.length > MAX_FILE_CHARS ? raw.slice(0, MAX_FILE_CHARS) + '\n… (файл обрезан)' : raw,
+      }
+    }
+  } catch {
+    return null
+  }
+
+  return {
+    kind: 'binary',
+    text:
+      `Двоичный файл, ${formatBytes(stat.size)}. Прочитать его содержимое нечем, ` +
+      'поэтому оно не показано. Не выдумывай структуру этого файла: если она нужна для ' +
+      'работы, попроси прислать выгрузку в текстовом виде (CSV) или напиши разбор так, ' +
+      'чтобы он сам определял формат и внятно сообщал об ошибке.',
+  }
+}
+
+function readCapped(relPath: string, projectId?: string): string | null {
+  const file = readFileForContext(relPath, projectId)
+  return file ? file.text : null
 }
 
 /**
@@ -140,7 +213,9 @@ function rankFiles(files: ProjectFile[], keywords: string[], forced: Set<string>
   }
 
   return [...files]
-    .filter((f) => isTextFile(f.path))
+    // Запрошенный агентом файл проходит фильтр расширений всегда: именно на
+    // этом отсеве и терялись таблицы, которые он просил.
+    .filter((f) => isTextFile(f.path) || forced.has(f.path))
     .sort((a, b) => {
       const d = score(a) - score(b)
       if (d !== 0) return d
